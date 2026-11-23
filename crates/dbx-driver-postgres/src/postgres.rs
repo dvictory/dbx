@@ -9760,29 +9760,117 @@ pub async fn execute_query_with_schema_and_max_rows_and_cancel(
     merge_postgres_query_and_reset_result(result, reset_result)
 }
 
+const POSTGRES_SET_DEFAULT_SEARCH_PATH_SQL: &str = "SET search_path TO DEFAULT";
+const POSTGRES_RESET_SEARCH_PATH_SQL: &str = "RESET search_path";
+
 /// GaussDB/openGauss reject PostgreSQL's `RESET search_path` syntax, so the
 /// post-query schema cleanup must re-issue `SET search_path TO DEFAULT` for
 /// those engines. Every other backend — and an unknown (`None`) type — keeps
-/// the historical `RESET search_path` behavior.
+/// the historical `RESET search_path` behavior, with a runtime fallback to
+/// `SET search_path TO DEFAULT` in [`reset_postgres_search_path`] for
+/// PostgreSQL-compatible engines (such as RisingWave) whose SQL parser rejects
+/// `RESET`.
 pub fn reset_search_path_sql(db_type: Option<DatabaseType>) -> &'static str {
     match db_type {
-        Some(DatabaseType::Gaussdb | DatabaseType::OpenGauss) => "SET search_path TO DEFAULT",
-        _ => "RESET search_path",
+        Some(DatabaseType::Gaussdb | DatabaseType::OpenGauss) => POSTGRES_SET_DEFAULT_SEARCH_PATH_SQL,
+        _ => POSTGRES_RESET_SEARCH_PATH_SQL,
     }
 }
 
-async fn reset_postgres_search_path(
+/// Whether an error from executing `RESET search_path` indicates that the
+/// server's SQL parser/dialect does not support `RESET` (for example,
+/// RisingWave returns `sql parser error: expected statement, found: RESET`,
+/// and GaussDB/openGauss connected under the generic PostgreSQL driver reject
+/// `RESET search_path` with a syntax error). Operational errors such as
+/// aborted transactions, timeouts, or dropped connections must return `false`.
+fn postgres_requires_set_default_search_path_reset(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    if error.contains("expected statement, found: reset") {
+        return true;
+    }
+    if error.contains("syntax error at or near \"reset\"") || error.contains("syntax error at or near \"search_path\"")
+    {
+        return true;
+    }
+    (error.contains("not supported") || error.contains("unsupported") || error.contains("unimplemented"))
+        && error.contains("reset")
+}
+
+fn postgres_set_default_search_path_reset_clients(
+) -> &'static Mutex<HashMap<usize, Weak<deadpool_postgres::StatementCache>>> {
+    static CLIENTS: OnceLock<Mutex<HashMap<usize, Weak<deadpool_postgres::StatementCache>>>> = OnceLock::new();
+    CLIENTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn postgres_client_uses_set_default_search_path_reset(client: &deadpool_postgres::Client) -> bool {
+    let statement_cache = &client.statement_cache;
+    let key = Arc::as_ptr(statement_cache) as usize;
+    let mut clients =
+        postgres_set_default_search_path_reset_clients().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match clients.get(&key).and_then(Weak::upgrade) {
+        Some(cached) if Arc::ptr_eq(&cached, statement_cache) => true,
+        _ => {
+            clients.remove(&key);
+            false
+        }
+    }
+}
+
+fn mark_postgres_client_set_default_search_path_reset(client: &deadpool_postgres::Client) {
+    let statement_cache = &client.statement_cache;
+    let key = Arc::as_ptr(statement_cache) as usize;
+    let mut clients =
+        postgres_set_default_search_path_reset_clients().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    clients.retain(|_, cached| cached.strong_count() > 0);
+    clients.insert(key, Arc::downgrade(statement_cache));
+}
+
+async fn reset_postgres_search_path_with<Exec, ExecFuture, Mark>(
+    db_type: Option<DatabaseType>,
+    uses_set_default_reset: bool,
+    mark_set_default_reset: Mark,
+    mut execute_sql: Exec,
+) -> Result<(), String>
+where
+    Exec: FnMut(&'static str) -> ExecFuture,
+    ExecFuture: Future<Output = Result<u64, String>>,
+    Mark: FnOnce(),
+{
+    let primary_sql =
+        if uses_set_default_reset { POSTGRES_SET_DEFAULT_SEARCH_PATH_SQL } else { reset_search_path_sql(db_type) };
+    match execute_sql(primary_sql).await {
+        Ok(_) => Ok(()),
+        Err(primary_error)
+            if primary_sql != POSTGRES_SET_DEFAULT_SEARCH_PATH_SQL
+                && postgres_requires_set_default_search_path_reset(&primary_error) =>
+        {
+            mark_set_default_reset();
+            log::info!("[postgres][schema.reset:set-default-fallback]");
+            execute_sql(POSTGRES_SET_DEFAULT_SEARCH_PATH_SQL).await.map(|_| ()).map_err(|fallback_error| {
+                format!("{primary_error}; SET search_path TO DEFAULT fallback failed: {fallback_error}")
+            })
+        }
+        Err(err) => Err(err),
+    }
+}
+
+pub async fn reset_postgres_search_path(
     client: &deadpool_postgres::Client,
     db_type: Option<DatabaseType>,
     timeout_duration: Duration,
     start: Instant,
 ) -> Result<(), String> {
-    let client = &EncodingClient::new(client);
     let reset_start = Instant::now();
-    match execute_postgres_infra_statement(client, reset_search_path_sql(db_type), timeout_duration, "schema.reset")
-        .await
+    let uses_set_default_reset = postgres_client_uses_set_default_search_path_reset(client);
+    match reset_postgres_search_path_with(
+        db_type,
+        uses_set_default_reset,
+        || mark_postgres_client_set_default_search_path_reset(client),
+        |sql| execute_postgres_infra_statement(client, sql, timeout_duration, "schema.reset"),
+    )
+    .await
     {
-        Ok(_) => {
+        Ok(()) => {
             log::info!(
                 "[postgres][execute_with_schema:reset-search-path:done] elapsed_ms={} total_ms={}",
                 reset_start.elapsed().as_millis(),
@@ -12704,6 +12792,142 @@ mod tests {
         assert_eq!(reset_search_path_sql(Some(DatabaseType::OpenGauss)), "SET search_path TO DEFAULT");
         assert_eq!(reset_search_path_sql(Some(DatabaseType::Postgres)), "RESET search_path");
         assert_eq!(reset_search_path_sql(None), "RESET search_path");
+    }
+
+    #[test]
+    fn postgres_reset_search_path_fallback_matches_only_unsupported_reset_errors() {
+        for (error, expected) in [
+            (
+                "ERROR: Failed to prepare the statement\n\nCaused by:\n  sql parser error: expected statement, found: RESET\nLINE 1: RESET search_path\n        ^\n (SQLSTATE XX000)",
+                true,
+            ),
+            ("ERROR: syntax error at or near \"search_path\"", true),
+            ("ERROR: syntax error at or near \"RESET\"", true),
+            ("ERROR: RESET search_path is not supported", true),
+            ("ERROR: unsupported statement: RESET", true),
+            ("ERROR: unimplemented: RESET search_path", true),
+            ("ERROR: current transaction is aborted, commands ignored until end of transaction block (SQLSTATE 25P02)", false),
+            ("PostgreSQL schema.reset timed out after 3 seconds", false),
+            ("connection closed", false),
+            ("ERROR: permission denied for schema public", false),
+            ("ERROR: syntax error at or near \"SELECT\"", false),
+        ] {
+            assert_eq!(
+                postgres_requires_set_default_search_path_reset(error),
+                expected,
+                "unexpected fallback decision for error: {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_reset_search_path_falls_back_to_set_default_for_risingwave_and_caches_mode() {
+        let risingwave_error = "ERROR: Failed to prepare the statement\n\nCaused by:\n  sql parser error: expected statement, found: RESET\nLINE 1: RESET search_path\n        ^\n (SQLSTATE XX000)";
+        let mut executed = Vec::new();
+        let mut marked = false;
+
+        let result = reset_postgres_search_path_with(
+            Some(DatabaseType::Postgres),
+            false,
+            || marked = true,
+            |sql| {
+                executed.push(sql);
+                async move {
+                    if sql == "RESET search_path" {
+                        Err(risingwave_error.to_string())
+                    } else {
+                        Ok(0)
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+        assert!(marked);
+        assert_eq!(executed, vec!["RESET search_path", "SET search_path TO DEFAULT"]);
+
+        // Once the connection is marked, subsequent resets skip `RESET search_path`.
+        let mut cached_executed = Vec::new();
+        let mut marked_again = false;
+        let cached_result = reset_postgres_search_path_with(
+            Some(DatabaseType::Postgres),
+            true,
+            || marked_again = true,
+            |sql| {
+                cached_executed.push(sql);
+                async move { Ok(0) }
+            },
+        )
+        .await;
+
+        assert_eq!(cached_result, Ok(()));
+        assert!(!marked_again);
+        assert_eq!(cached_executed, vec!["SET search_path TO DEFAULT"]);
+    }
+
+    #[tokio::test]
+    async fn postgres_reset_search_path_does_not_retry_unrelated_errors_or_hide_fallback_failures() {
+        let mut executed = Vec::new();
+        let mut marked = false;
+        let aborted_error =
+            "ERROR: current transaction is aborted, commands ignored until end of transaction block (SQLSTATE 25P02)";
+        let aborted_result = reset_postgres_search_path_with(
+            Some(DatabaseType::Postgres),
+            false,
+            || marked = true,
+            |sql| {
+                executed.push(sql);
+                async move { Err(aborted_error.to_string()) }
+            },
+        )
+        .await;
+        assert_eq!(aborted_result, Err(aborted_error.to_string()));
+        assert!(!marked);
+        assert_eq!(executed, vec!["RESET search_path"]);
+
+        // Backends already routed to `SET search_path TO DEFAULT` must not retry.
+        let mut gauss_executed = Vec::new();
+        let mut gauss_marked = false;
+        let gauss_result = reset_postgres_search_path_with(
+            Some(DatabaseType::Gaussdb),
+            false,
+            || gauss_marked = true,
+            |sql| {
+                gauss_executed.push(sql);
+                async move { Err("ERROR: syntax error at or near \"search_path\"".to_string()) }
+            },
+        )
+        .await;
+        assert!(gauss_result.is_err());
+        assert!(!gauss_marked);
+        assert_eq!(gauss_executed, vec!["SET search_path TO DEFAULT"]);
+
+        // If the fallback itself fails, surface both the primary and fallback errors.
+        let mut fallback_executed = Vec::new();
+        let mut fallback_marked = false;
+        let fallback_result = reset_postgres_search_path_with(
+            Some(DatabaseType::Postgres),
+            false,
+            || fallback_marked = true,
+            |sql| {
+                fallback_executed.push(sql);
+                async move {
+                    if sql == "RESET search_path" {
+                        Err("sql parser error: expected statement, found: RESET".to_string())
+                    } else {
+                        Err("connection closed".to_string())
+                    }
+                }
+            },
+        )
+        .await;
+        assert!(fallback_marked);
+        assert_eq!(fallback_executed, vec!["RESET search_path", "SET search_path TO DEFAULT"]);
+        assert_eq!(
+            fallback_result,
+            Err("sql parser error: expected statement, found: RESET; SET search_path TO DEFAULT fallback failed: connection closed".to_string())
+        );
     }
 
     #[test]

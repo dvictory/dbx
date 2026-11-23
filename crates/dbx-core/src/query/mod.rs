@@ -6102,18 +6102,14 @@ async fn exec_tx_pg_inner(
     }
     let tx_result = exec_tx_pg_statements(&mut client, statements, &budget, cancel_context).await;
 
-    // GaussDB/openGauss reject PostgreSQL's RESET search_path syntax.
+    // GaussDB/openGauss and PostgreSQL-compatible engines like RisingWave reject
+    // PostgreSQL's `RESET search_path` syntax; share the fallback-aware helper.
     let reset_result = if had_schema {
-        db::postgres::execute_postgres_infra_statement(
-            &client,
-            db::postgres::reset_search_path_sql(db_type),
-            budget.cleanup_timeout,
-            "schema.reset",
-        )
-        .await
-        .map_err(|err| QueryExecutionError::Legacy(format!("PostgreSQL schema.reset cleanup failed: {err}")))
+        db::postgres::reset_postgres_search_path(&client, db_type, budget.cleanup_timeout, start)
+            .await
+            .map_err(QueryExecutionError::Legacy)
     } else {
-        Ok(0)
+        Ok(())
     };
 
     match (tx_result, reset_result) {
